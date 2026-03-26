@@ -150,12 +150,26 @@ class ContentGeneratorTab(tk.Frame):
         self.img_status.pack(side=LEFT, padx=12)
 
         # ── 티스토리 발행 영역 ───────────────────────────────
-        tistory_frame = ttk.LabelFrame(right, text=" 티스토리 발행 (수동 붙여넣기) ")
+        tistory_frame = ttk.LabelFrame(right, text=" 티스토리 발행 ")
         tistory_frame.pack(fill=X, padx=4, pady=(0, 4))
 
+        # 자동 발행 행
+        auto_row = ttk.Frame(tistory_frame)
+        auto_row.pack(fill=X, padx=8, pady=(6, 2))
+        self.auto_publish_btn = tbs.Button(auto_row, text="자동 발행 (Selenium)",
+                                           bootstyle="danger", command=self._auto_publish_tistory)
+        self.auto_publish_btn.pack(side=LEFT, padx=4)
+        self.auto_publish_label = ttk.Label(auto_row, text="", font=("", 9))
+        self.auto_publish_label.pack(side=LEFT, padx=8)
+
+        # 수동 발행 행 (fallback)
+        manual_lbl = ttk.Label(tistory_frame, text="수동 발행 (fallback):",
+                               font=("", 8), foreground="gray")
+        manual_lbl.pack(padx=12, pady=(4, 0), anchor=W)
+
         tistory_row1 = ttk.Frame(tistory_frame)
-        tistory_row1.pack(fill=X, padx=8, pady=(6, 2))
-        self.copy_html_btn = tbs.Button(tistory_row1, text="본문 HTML 복사", bootstyle="primary",
+        tistory_row1.pack(fill=X, padx=8, pady=(2, 2))
+        self.copy_html_btn = tbs.Button(tistory_row1, text="본문 HTML 복사", bootstyle="primary-outline",
                                         command=self._copy_blog_html)
         self.copy_html_btn.pack(side=LEFT, padx=4)
         tbs.Button(tistory_row1, text="제목 복사", bootstyle="secondary-outline",
@@ -164,14 +178,8 @@ class ContentGeneratorTab(tk.Frame):
                    command=self._copy_tags).pack(side=LEFT, padx=4)
         tbs.Button(tistory_row1, text="이미지 저장", bootstyle="secondary-outline",
                    command=self._save_image_file).pack(side=LEFT, padx=4)
-
-        tistory_row2 = ttk.Frame(tistory_frame)
-        tistory_row2.pack(fill=X, padx=8, pady=(2, 6))
-        tbs.Button(tistory_row2, text="티스토리 글쓰기 열기", bootstyle="light-outline",
+        tbs.Button(tistory_row1, text="글쓰기 열기", bootstyle="light-outline",
                    command=self._open_tistory_editor).pack(side=LEFT, padx=4)
-        ttk.Label(tistory_row2,
-                  text="① HTML 복사 → ② 글쓰기 열기 → ③ HTML 모드 전환 → ④ 붙여넣기 → ⑤ 발행",
-                  font=("", 8), foreground="gray").pack(side=LEFT, padx=12)
 
         # ── 인스타그램 발행 영역 ─────────────────────────────
         insta_frame = ttk.LabelFrame(right, text=" 인스타그램 발행 ")
@@ -566,6 +574,112 @@ class ContentGeneratorTab(tk.Frame):
             ))
         else:
             self.after(0, lambda: self.img_status.config(text="이미지 생성 실패"))
+
+    # ── 티스토리 자동 발행 (Selenium) ─────────────────────────
+    def _auto_publish_tistory(self):
+        title = self.blog_title_var.get().strip()
+        body = self.blog_body.get("1.0", END).strip()
+        if not title or not body:
+            messagebox.showwarning("내용 없음", "제목과 본문을 먼저 입력하세요.", parent=self)
+            return
+
+        api = self.settings.get("api", {})
+        blog_url = api.get("tistory_blog_url", "").strip()
+        email = api.get("tistory_kakao_email", "").strip()
+        pw_encoded = api.get("tistory_kakao_pw", "").strip()
+
+        if not blog_url or not email or not pw_encoded:
+            messagebox.showwarning(
+                "설정 필요",
+                "설정 탭 > API 설정에서\n블로그 주소, 카카오 이메일, 비밀번호를 입력하세요.\n\n"
+                "수동 발행: 아래 'HTML 복사' → '글쓰기 열기'를 사용하세요.",
+                parent=self
+            )
+            return
+
+        # 하루 발행 횟수 체크
+        from modules.tistory_publisher import get_today_publish_count, _deobfuscate
+        max_per_day = self.settings.get("publish", {}).get("maxPerDay", 1)
+        today_count = get_today_publish_count()
+        if today_count >= max_per_day:
+            if not messagebox.askyesno(
+                "발행 횟수 초과",
+                f"오늘 이미 {today_count}편 발행했습니다.\n"
+                f"하루 {max_per_day}편을 권장합니다. 계속하시겠어요?",
+                parent=self
+            ):
+                return
+
+        pw = _deobfuscate(pw_encoded)
+        debug = api.get("tistory_debug", False)
+
+        # HTML 생성
+        ctx = self._get_publish_context()
+        html = self._clipboard_pub.build_full_html(
+            body, title, ctx["keyword"], ctx["faq_schema"],
+            ctx["cta_text"], ctx["cta_url"],
+            ctx["author_name"], ctx["author_title"], ctx["author_career"],
+            ctx["main_color"], ctx["sub_color"],
+            self.blog_image_path
+        )
+
+        tags = self.tag_var.get().strip()
+        category = self.category_var.get().strip() if hasattr(self, "category_var") else ""
+        image_paths = getattr(self, "blog_image_paths", [])
+
+        # 발행 지연 모드
+        delay_mode = self.settings.get("publish", {}).get("delay", "immediate")
+
+        self.auto_publish_btn.configure(state=DISABLED)
+        self.auto_publish_label.config(text="발행 준비 중...", foreground="orange")
+        self._set_status("Selenium 자동 발행 시작...")
+
+        def do_publish():
+            from modules.tistory_publisher import TistorySeleniumPublisher
+            pub = TistorySeleniumPublisher(blog_url, email, pw, headless=not debug)
+            result = pub.publish(title, html, tags, category, image_paths)
+            self.after(0, lambda: self._on_auto_publish_done(result))
+
+        if delay_mode == "random":
+            from modules.tistory_publisher import delayed_publish
+            delay_sec = delayed_publish(do_publish, "random")
+            minutes = delay_sec // 60
+            self.auto_publish_label.config(
+                text=f"예약됨: {minutes}분 후 자동 발행", foreground="#4CAF50"
+            )
+            self._set_status(f"발행 예약: 약 {minutes}분 후 자동 발행됩니다.")
+        else:
+            threading.Thread(target=do_publish, daemon=True).start()
+
+    def _on_auto_publish_done(self, result: dict):
+        self.auto_publish_btn.configure(state=NORMAL)
+        if result["success"]:
+            url = result.get("url", "")
+            self.auto_publish_label.config(text="발행 성공!", foreground="#4CAF50")
+            self._set_status(f"자동 발행 완료! URL: {url}")
+            messagebox.showinfo("발행 완료", f"티스토리 자동 발행 성공!\n\nURL: {url}", parent=self)
+            # DB 기록 자동 저장
+            ctx = self._get_publish_context()
+            db_manager.insert_record({
+                "org": self.org_var.get(),
+                "keyword": ctx["keyword"],
+                "title": self.blog_title_var.get().strip(),
+                "blog_status": "success",
+                "blog_url": url,
+                "insta_status": "pending",
+                "landing_url": ctx["landing_url"],
+                "category": self.category_var.get() if hasattr(self, "category_var") else "",
+            })
+        else:
+            step = result.get("step", "")
+            error = result.get("error", "알 수 없는 오류")
+            self.auto_publish_label.config(text=f"실패: {step}", foreground="red")
+            self._set_status(f"자동 발행 실패 [{step}]: {error[:80]}")
+            messagebox.showerror(
+                "자동 발행 실패",
+                f"단계: {step}\n오류: {error}\n\n수동 발행: 'HTML 복사' → '글쓰기 열기'를 사용하세요.",
+                parent=self
+            )
 
     # ── 티스토리 발행 (클립보드) ──────────────────────────────
     def _get_publish_context(self) -> dict:

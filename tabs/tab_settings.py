@@ -37,38 +37,64 @@ class SettingsTab(tk.Frame):
 
         api = self.settings.get("api", {})
 
-        # 티스토리 (API 불필요 — 수동 붙여넣기)
-        tistory_lf = ttk.LabelFrame(f, text=" 티스토리 (수동 발행 — API 불필요) ")
+        # 티스토리 (Selenium 자동 발행 + 수동 fallback)
+        tistory_lf = ttk.LabelFrame(f, text=" 티스토리 (Selenium 자동 발행) ")
         tistory_lf.pack(fill=X, padx=12, pady=6)
         tistory_note = ttk.Label(
             tistory_lf,
-            text="티스토리 Open API는 2024.02 종료됨. HTML 클립보드 복사 → 수동 붙여넣기 방식으로 발행합니다.",
-            foreground="gray", wraplength=500
+            text="카카오 계정으로 로그인 → Selenium이 자동으로 글 발행합니다.\n"
+                 "자동 발행 실패 시 클립보드 복사 → 수동 붙여넣기도 가능합니다.",
+            foreground="gray", wraplength=500, justify=LEFT
         )
         tistory_note.pack(padx=12, pady=(6, 2), anchor=W)
 
-        for lbl, key, default in [
-            ("블로그 주소", "tistory_blog_url", "https://bksolution.tistory.com"),
-            ("글쓰기 URL",  "tistory_write_url", "https://bksolution.tistory.com/manage/newpost"),
+        self._tistory_vars = {}
+        for lbl, key, default, show in [
+            ("블로그 주소",    "tistory_blog_url",  "https://bksolution.tistory.com", ""),
+            ("카카오 이메일",   "tistory_kakao_email", "", ""),
+            ("카카오 비밀번호", "tistory_kakao_pw",    "", "*"),
         ]:
             row = ttk.Frame(tistory_lf)
             row.pack(fill=X, padx=12, pady=3)
-            ttk.Label(row, text=f"{lbl}:", width=12, anchor=E).pack(side=LEFT)
-            var = tk.StringVar(value=api.get(key, default))
-            ttk.Entry(row, textvariable=var, width=50).pack(side=LEFT, padx=4)
-            if not hasattr(self, "_tistory_vars"):
-                self._tistory_vars = {}
+            ttk.Label(row, text=f"{lbl}:", width=14, anchor=E).pack(side=LEFT)
+            # 비밀번호는 base64 디코딩
+            raw_val = api.get(key, default)
+            if show == "*" and raw_val:
+                from modules.tistory_publisher import _deobfuscate
+                raw_val = _deobfuscate(raw_val)
+            var = tk.StringVar(value=raw_val)
+            entry = ttk.Entry(row, textvariable=var, show=show, width=46)
+            entry.pack(side=LEFT, padx=4)
+            if show:
+                def toggle_pw(e=entry, s=show):
+                    e.configure(show="" if e.cget("show") == s else s)
+                tbs.Button(row, text="보기", bootstyle="secondary-outline",
+                           width=4, command=toggle_pw).pack(side=LEFT)
             self._tistory_vars[key] = var
 
-        open_row = ttk.Frame(tistory_lf)
-        open_row.pack(fill=X, padx=12, pady=(2, 8))
+        # 디버그 모드 (headless 끄기)
+        self._tistory_debug_var = tk.BooleanVar(value=api.get("tistory_debug", False))
+        debug_row = ttk.Frame(tistory_lf)
+        debug_row.pack(fill=X, padx=12, pady=3)
+        ttk.Checkbutton(debug_row, text="디버그 모드 (브라우저 창 표시)",
+                        variable=self._tistory_debug_var).pack(side=LEFT, padx=(110, 0))
+
+        # 버튼 행
+        btn_row = ttk.Frame(tistory_lf)
+        btn_row.pack(fill=X, padx=12, pady=(4, 8))
+        self.tistory_test_label = ttk.Label(btn_row, text="")
         tbs.Button(
-            open_row, text="티스토리 글쓰기 열기", bootstyle="light-outline",
+            btn_row, text="로그인 테스트", bootstyle="info-outline",
+            command=self._test_tistory_login
+        ).pack(side=LEFT, padx=(0, 6))
+        tbs.Button(
+            btn_row, text="수동 글쓰기 열기", bootstyle="light-outline",
             command=lambda: webbrowser.open(
-                self._tistory_vars.get("tistory_write_url",
-                                       tk.StringVar(value="https://bksolution.tistory.com/manage/newpost")).get()
+                self._tistory_vars.get("tistory_blog_url",
+                    tk.StringVar(value="https://bksolution.tistory.com")).get() + "/manage/newpost"
             )
         ).pack(side=LEFT)
+        self.tistory_test_label.pack(side=LEFT, padx=8)
 
         # Meta (인스타그램)
         meta_lf = ttk.LabelFrame(f, text=" Meta (인스타그램 Graph API) — 선택사항 ")
@@ -285,13 +311,51 @@ class SettingsTab(tk.Frame):
 
         threading.Thread(target=run, daemon=True).start()
 
+    def _test_tistory_login(self):
+        blog_url = self._tistory_vars.get("tistory_blog_url", tk.StringVar()).get().strip()
+        email = self._tistory_vars.get("tistory_kakao_email", tk.StringVar()).get().strip()
+        pw = self._tistory_vars.get("tistory_kakao_pw", tk.StringVar()).get().strip()
+        if not blog_url or not email or not pw:
+            self.tistory_test_label.config(text="블로그 주소, 이메일, 비밀번호를 모두 입력하세요.", foreground="orange")
+            return
+        debug = self._tistory_debug_var.get()
+        self.tistory_test_label.config(text="로그인 테스트 중...", foreground="gray")
+
+        def run():
+            try:
+                from modules.tistory_publisher import TistorySeleniumPublisher
+                pub = TistorySeleniumPublisher(blog_url, email, pw, headless=not debug)
+                result = pub.test_login()
+                if result["success"]:
+                    self.after(0, lambda: self.tistory_test_label.config(
+                        text="로그인 성공!", foreground="#4CAF50"))
+                else:
+                    msg = result.get("error", "알 수 없는 오류")[:60]
+                    self.after(0, lambda: self.tistory_test_label.config(
+                        text=f"로그인 실패: {msg}", foreground="red"))
+            except ImportError:
+                self.after(0, lambda: self.tistory_test_label.config(
+                    text="selenium 패키지 필요: pip install selenium", foreground="red"))
+            except Exception as e:
+                self.after(0, lambda: self.tistory_test_label.config(
+                    text=f"오류: {str(e)[:60]}", foreground="red"))
+
+        threading.Thread(target=run, daemon=True).start()
+
     def _save_api(self):
         if "api" not in self.settings:
             self.settings["api"] = {}
-        # 티스토리 URL
+        # 티스토리
         if hasattr(self, "_tistory_vars"):
+            from modules.tistory_publisher import _obfuscate
             for key, var in self._tistory_vars.items():
-                self.settings["api"][key] = var.get()
+                val = var.get()
+                # 비밀번호는 base64 인코딩해서 저장
+                if key == "tistory_kakao_pw" and val:
+                    val = _obfuscate(val)
+                self.settings["api"][key] = val
+        if hasattr(self, "_tistory_debug_var"):
+            self.settings["api"]["tistory_debug"] = self._tistory_debug_var.get()
         # Meta / Naver / Claude
         for group_key, fields in self.api_vars.items():
             if group_key not in self.settings["api"]:
